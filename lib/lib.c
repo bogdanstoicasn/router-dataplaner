@@ -223,6 +223,7 @@ int read_rtable(const char *path, struct route_table_entry *rtable)
 		}
 		j++;
 	}
+	fclose(fp); // modified by stoica bogdan
 	return j;
 }
 
