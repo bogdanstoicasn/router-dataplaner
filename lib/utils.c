@@ -31,50 +31,19 @@ struct route_table_entry *alloc_rtable(const char *path)
 
 }
 
-/*
-    Function that allocs the arp table from a file
-
-*/
-struct arp_table_entry *alloc_arp_table(const char *path)
-{
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        fprintf(stderr, "Could not open file %s\n", path);
-        return NULL;
-    }
-
-    // now we get number of lines
-    int lines = 0;
-    char c;
-    while ((c = fgetc(fp)) != EOF) {
-        if (c == '\n') {
-            lines++;
-        }
-    }
-
-    // now we allocate the rtable
-    struct arp_table_entry *arp_table = malloc(lines * sizeof(struct arp_table_entry));
-    if (!arp_table) {
-        fprintf(stderr, "Could not allocate arp table\n");
-        exit(1);
-    }
-    fclose(fp);
-    return arp_table;
-}
-
 int comparator_function(const void *first, const void *second)
 {
     struct route_table_entry *first_entry = (struct route_table_entry *)first;
     struct route_table_entry *second_entry = (struct route_table_entry *)second;
 
-    if (ntohl(first_entry->prefix) > ntohl(second_entry->prefix)) {
+    if (ntohl(first_entry->prefix) < ntohl(second_entry->prefix)) {
         return 1;
-    } else if (ntohl(first_entry->prefix) < ntohl(second_entry->prefix)) {
+    } else if (ntohl(first_entry->prefix) > ntohl(second_entry->prefix)) {
         return -1;
     } else {
-        if (ntohl(first_entry->mask) > ntohl(second_entry->mask)) {
+        if (ntohl(first_entry->mask) < ntohl(second_entry->mask)) {
             return 1;
-        } else if (ntohl(first_entry->mask) < ntohl(second_entry->mask)) {
+        } else if (ntohl(first_entry->mask) > ntohl(second_entry->mask)) {
             return -1;
         } else {
             return 0;
@@ -85,31 +54,33 @@ int comparator_function(const void *first, const void *second)
 /*
     Function that searches best route in rtable using binary search
 */
-struct route_table_entry *get_best_rtable(uint32_t dest_ip, struct route_table_entry *rtable, int rtable_size)
+struct route_table_entry *get_best_rtable(uint32_t ip_dest, struct route_table_entry *rtable, int rtable_len)
 {
-    int left = 0;
-    int right = rtable_size - 1;
-    int mid;
-    struct route_table_entry *best_route = NULL;
-    while (left <= right) {
-        mid = left + (right - left) / 2;
-        if ((dest_ip & rtable[mid].mask) == rtable[mid].prefix && !best_route) {
-            best_route = &rtable[mid];
-        }
+	/*
+	 * Binary search used to get the best route using LPM.
+	 * O(logn) time complexity.
+	 */
+	int l = 0;
+	int r = rtable_len - 1;
+	struct route_table_entry *next_hop = NULL;
 
-        if ((dest_ip & rtable[mid].mask) == rtable[mid].prefix && best_route) {
-            if (ntohl(rtable[mid].mask) > ntohl(best_route->mask)) {
-                best_route = &rtable[mid];
-            }
-        }
+	while (l <= r) {
+		int m = l + (r - l) / 2;
 
-        if ((dest_ip & rtable[mid].mask) > rtable[mid].prefix) {
-            left = mid + 1;
-        } else {
-            right = mid - 1;
-        }
-    }
-    return best_route;
+		if ((ip_dest & rtable[m].mask) == rtable[m].prefix && !next_hop)
+			next_hop = &rtable[m];
+
+		/* If we find a better matching route, we save it.*/
+		if ((ip_dest & rtable[m].mask) == rtable[m].prefix && next_hop)
+			if (ntohl(rtable[m].mask) > ntohl(next_hop->mask))
+				next_hop = &rtable[m];
+
+		if (ntohl(rtable[m].prefix) >= ntohl(ip_dest))
+			l = m + 1;
+		else
+			r = m - 1;
+	}
+	return next_hop;
 }
 
 /*
