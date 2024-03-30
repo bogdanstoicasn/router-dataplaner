@@ -58,6 +58,10 @@
   "C_Cpp_Runner.msvcSecureNoWarnings": false,
   "files.associations": {
     "utils.h": "c",
-    "endian.h": "c"
+    "endian.h": "c",
+    "protocols.h": "c",
+    "lib.h": "c",
+    "in.h": "c",
+    "stdlib.h": "c"
   }
 }
