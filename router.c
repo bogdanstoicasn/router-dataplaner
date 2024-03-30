@@ -6,10 +6,15 @@
 #include "protocols.h"
 #include "list.h"
 
-#define ETHERTYPE_IP 0x0800
-#define ETHERTYPE_ARP 0x0806
-#define TTL_MAX 64
-#define MAX_ARP_TABLE_LEN 20
+#define ETHERTYPE_IP 0x0800 // Ethernet type for IP
+#define ETHERTYPE_ARP 0x0806 // Ethernet type for ARP
+#define TTL_MAX 64 // Maximum value of TTL
+#define MAX_ARP_TABLE_LEN 20 // Maximum number of entries in ARP table
+#define BROADCAST 0xff // Broadcast MAC address
+#define HTYPE_ETHERNET 1 // Ethernet hardware type
+#define ARP_HWADDR_LEN_ETH 6  // Length of Ethernet MAC address
+#define ARP_PROTOADDR_LEN_IPV4 4  // Length of IPv4 address
+#define OFFSET_ADDR 1 // General use offset for addresses
 
 struct waiting_element {
 	char *eth_hdr;
@@ -17,6 +22,7 @@ struct waiting_element {
 	struct route_table_entry *next_route;
 };
 
+// main data structures
 static struct route_table_entry *rtable;
 static int rtable_len;
 
@@ -24,6 +30,7 @@ static struct arp_table_entry *arp_table;
 static int arp_table_len;
 
 static queue packets_queue;
+// end of main data structures
 
 static struct route_table_entry *alloc_rtable(const char *path)
 {
@@ -46,7 +53,7 @@ static struct route_table_entry *alloc_rtable(const char *path)
     struct route_table_entry *rtable = malloc(lines * sizeof(struct route_table_entry));
     if (!rtable) {
         fprintf(stderr, "Could not allocate rtable\n");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
     fclose(fp);
     return rtable;
@@ -114,38 +121,45 @@ struct arp_table_entry *get_best_arp(uint32_t dest_ip)
     return NULL;
 }
 
-
+/*
+	Function that sends a packet to a link
+	@param eth - the ethernet header
+	@param next - the next hop
+	@param interface - the interface
+*/
 static void send_arp_request(struct ether_header *eth, struct route_table_entry *next, uint32_t interface)
 {
-	struct arp_header *arp = (struct arp_header *)(eth + 1);
+	struct arp_header *arp = (struct arp_header *)(eth + OFFSET_ADDR);
 
-	arp->htype = htons(1);
+	// set the ethernet header and type of packet
+	memset(eth->ether_dhost, BROADCAST, sizeof(eth->ether_dhost));
+	eth->ether_type = htons(ETHERTYPE_ARP);
+	// end of setting the ethernet header
+
+	memset(arp, 0, sizeof(*arp));
+
+	arp->htype = arp->op = htons(HTYPE_ETHERNET);
+
 	arp->ptype = htons(ETHERTYPE_IP);
-	arp->hlen = 6;
-	arp->plen = 4;
-	// the request
-	arp->op = htons(1);
+	arp->hlen = ARP_HWADDR_LEN_ETH;
+	arp->plen = ARP_PROTOADDR_LEN_IPV4;
 
 	get_interface_mac(next->interface, arp->sha);
 
 	uint32_t router_ip;
 	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
+	// set the arp header
 	arp->spa = router_ip;
-
-	memset(arp->tha, 0, sizeof(arp->tha));
 	arp->tpa = next->next_hop;
 
-	memset(eth->ether_dhost, 0xff, sizeof(eth->ether_dhost));
-	eth->ether_type = htons(ETHERTYPE_ARP);
-	//maybe here with * HERE TODO
 	send_to_link(interface, (char *)eth, sizeof(*eth) + sizeof(*arp));
 }
 
 static void send_icmp_packet(struct ether_header *eth, uint32_t interface, uint8_t type)
 {
-	struct iphdr *ip = (struct iphdr *)(eth + 1);
-	struct icmphdr *icmp = (struct icmphdr *)(ip + 1);
+	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
+	struct icmphdr *icmp = (struct icmphdr *)(ip + OFFSET_ADDR);
 
 	// 2 types of icmp packets: 11 and 3, 11 is for ttl exceeded, 3 is for destination unreachable
 
@@ -183,50 +197,51 @@ static void send_icmp_packet(struct ether_header *eth, uint32_t interface, uint8
 	free(icmp_body);
 }
 
-static void send_ip_packet(struct ether_header *eth, uint32_t interface, uint32_t len)
+static void ip_packet_for_router(struct ether_header *eth, uint32_t interface, uint32_t len)
 {
-	struct iphdr *ip = (struct iphdr *)(eth + 1);
+	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
 	uint32_t router_ip;
 	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
-	// If the packet is for the router
-	if (ip->daddr == router_ip) {
-		struct icmphdr *icmp = (struct icmphdr *)(ip + 1);
+	struct icmphdr *icmp = (struct icmphdr *)(ip + OFFSET_ADDR);
 
-		icmp->type = icmp->code = icmp->checksum = 0;
-		icmp->checksum = htons(checksum((uint16_t *)icmp, sizeof(*icmp)));
+	icmp->type = icmp->code = icmp->checksum = 0;
+	icmp->checksum = htons(checksum((uint16_t *)icmp, sizeof(*icmp)));
 
-		uint32_t length = ntohs(ip->tot_len) - sizeof(*ip) - sizeof(*icmp);
+	uint32_t length = ntohs(ip->tot_len) - sizeof(*ip) - sizeof(*icmp);
 
-		int8_t *icmp_body = malloc(length);
-		DIE(icmp_body == NULL, "malloc in ip_packet");
+	int8_t *icmp_body = malloc(length);
+	DIE(icmp_body == NULL, "malloc in ip_packet");
 
-		memcpy(icmp_body, ip, length);
+	memcpy(icmp_body, ip, length);
 
-		ip->daddr = ip->saddr;
-		ip->saddr = router_ip;
-		ip->ttl = htons(TTL_MAX);
-		ip->protocol = IPPROTO_ICMP;
-		ip->tot_len = htons((uint16_t)length + sizeof(*ip) + sizeof(*icmp));
+	ip->daddr = ip->saddr;
+	ip->saddr = router_ip;
+	ip->ttl = htons(TTL_MAX);
+	ip->protocol = IPPROTO_ICMP;
+	ip->tot_len = htons((uint16_t)length + sizeof(*ip) + sizeof(*icmp));
 
-		ip->check = 0;
-		ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
+	ip->check = 0;
+	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
 
-		memcpy(eth->ether_dhost, eth->ether_shost, sizeof(eth->ether_shost));
+	memcpy(eth->ether_dhost, eth->ether_shost, sizeof(eth->ether_shost));
 
-		get_interface_mac(interface, eth->ether_shost);
+	get_interface_mac(interface, eth->ether_shost);
 
-		memcpy((char *)icmp + sizeof(*icmp), icmp_body, length);
+	memcpy((char *)icmp + sizeof(*icmp), icmp_body, length);
 
-		send_to_link(interface, (char *)eth, sizeof(*eth) + sizeof(*ip) + sizeof(*icmp) + length);
+	send_to_link(interface, (char *)eth, sizeof(*eth) + sizeof(*ip) + sizeof(*icmp) + length);
 
-		free(icmp_body);
+	free(icmp_body);
+}
 
-		return;
-	}
+static void ip_packet_for_host(struct ether_header *eth, uint32_t interface, uint32_t len)
+{
+	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
-	// If the packet is not for the router
+	uint32_t router_ip;
+	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
 	uint16_t old_checksum = ip->check;
 	ip->check = 0;
@@ -271,48 +286,65 @@ static void send_ip_packet(struct ether_header *eth, uint32_t interface, uint32_
 		send_arp_request(eth, next, interface);
 		return;
 	}
+
 	memcpy(eth->ether_dhost, arp->mac, sizeof(arp->mac));
 
 	send_to_link(next->interface, (char *)eth, len);
 }
 
-static void send_arp_packet(struct ether_header *eth, uint32_t interface, uint32_t len)
+static void send_ip_packet(struct ether_header *eth, uint32_t interface, uint32_t len)
 {
-	struct arp_header *arp = (struct arp_header *)(eth + 1);
+	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
-	if (ntohs(arp->op) == 1) {
-		uint32_t router_ip;
-		inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
+	uint32_t router_ip;
+	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
-		if (arp->tpa != router_ip)
-			return;
-		
-		arp->op = htons(2);
-		arp->tpa = arp->spa;
-		arp->spa = router_ip;
-
-		memcpy(arp->tha, arp->sha, sizeof(arp->sha));
-		get_interface_mac(interface, arp->sha);
-
-		memcpy(eth->ether_dhost, arp->tha, sizeof(arp->tha));
-		get_interface_mac(interface, eth->ether_shost);
-
-		send_to_link(interface, (char *)eth, len);
-
+	// If the packet is for the router
+	if (ip->daddr == router_ip) {
+		ip_packet_for_router(eth, interface, len);
 		return;
 	}
 
-	arp_table[arp_table_len].ip = arp->spa;
-	memcpy(arp_table[arp_table_len].mac, arp->sha, sizeof(arp->sha));
-	++arp_table_len;
+	// If the packet is for a host
+	ip_packet_for_host(eth, interface, len);
 
-	while (!queue_empty(packets_queue)) {
-		struct waiting_element *entry = queue_deq(packets_queue);
-		send_ip_packet((struct ether_header *)entry->eth_hdr, interface, entry->len);
-		free(entry->eth_hdr);
-		free(entry);
+}
+
+static void send_arp_packet(struct ether_header *eth, uint32_t interface, uint32_t len)
+{
+	struct arp_header *arp = (struct arp_header *)(eth + OFFSET_ADDR);
+
+
+	if (ntohs(arp->op) != 1) {
+		arp_table[arp_table_len].ip = arp->spa;
+		memcpy(arp_table[arp_table_len].mac, arp->sha, sizeof(arp->sha));
+		++arp_table_len;
+
+		while (!queue_empty(packets_queue)) {
+			struct waiting_element *entry = queue_deq(packets_queue);
+			send_ip_packet((struct ether_header *)entry->eth_hdr, interface, entry->len);
+			free(entry->eth_hdr);
+			free(entry);
+		}
+		return;
 	}
 
+	uint32_t router_ip;
+	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
+	if (arp->tpa != router_ip)
+		return;
+	
+	arp->op = htons(2);
+	arp->tpa = arp->spa;
+	arp->spa = router_ip;
+
+	memcpy(arp->tha, arp->sha, sizeof(arp->sha));
+	get_interface_mac(interface, arp->sha);
+
+	memcpy(eth->ether_dhost, arp->tha, sizeof(arp->tha));
+	get_interface_mac(interface, eth->ether_shost);
+
+	send_to_link(interface, (char *)eth, len);
 }
 
 int main(int argc, char *argv[])
@@ -321,12 +353,24 @@ int main(int argc, char *argv[])
 
 	// Do not modify this line
 	init(argc - 2, argv + 2);
+
 	rtable = alloc_rtable(argv[1]);
 	rtable_len = read_rtable(argv[1], rtable);
 
 	arp_table = malloc(MAX_ARP_TABLE_LEN * sizeof(*arp_table));
+	if (!arp_table) {
+		fprintf(stderr, "Could not allocate arp table\n");
+		exit(EXIT_FAILURE);
+	}
+
 	arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+
 	packets_queue = queue_create();
+	if (!packets_queue) {
+		fprintf(stderr, "Could not allocate packets queue\n");
+		exit(EXIT_FAILURE);
+	}
+
 	qsort(rtable, rtable_len, sizeof(struct route_table_entry), comparator_function);
 
 	while (1) {
