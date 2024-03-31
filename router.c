@@ -283,7 +283,7 @@ static void ip_packet_for_host(struct ether_header *eth, uint32_t interface, uin
 		entry->next_route = next;
 		queue_enq(packets_queue, entry);
 		// send arp request
-		send_arp_request(eth, next, interface);
+		send_arp_request(eth, next, next->interface);
 		return;
 	}
 
@@ -363,7 +363,7 @@ int main(int argc, char *argv[])
 		exit(EXIT_FAILURE);
 	}
 
-	arp_table_len = parse_arp_table("arp_table.txt", arp_table);
+	//arp_table_len = parse_arp_table("arp_table.txt", arp_table);
 
 	packets_queue = queue_create();
 	if (!packets_queue) {
