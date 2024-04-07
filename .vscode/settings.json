@@ -62,6 +62,8 @@
     "protocols.h": "c",
     "lib.h": "c",
     "in.h": "c",
-    "stdlib.h": "c"
+    "stdlib.h": "c",
+    "queue.h": "c",
+    "inet.h": "c"
   }
 }

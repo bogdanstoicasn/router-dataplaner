@@ -18,14 +18,14 @@
 #define POW_2(x) (1 << (x)) // Power of 2
 
 
-struct simple_memeory_pool {
+struct simple_memory_pool {
 	void *memory;
 	size_t size;
 	size_t used; // in this project was used for debugging
 };
 
 struct waiting_element {
-	char *eth_hdr;
+	void *eth_hdr;
 	int len;
 	struct route_table_entry *next_route;
 };
@@ -38,9 +38,10 @@ static struct arp_table_entry *arp_table;
 static int arp_table_len;
 
 static queue packets_queue;
-static struct simple_memeory_pool pool;
+static struct simple_memory_pool pool;
 // end of main data structures
 
+#define ROUTER_RESOURCES_SECTION
 /*
 	Function that initializes the memory pool
 	@param size - the size of the memory pool
@@ -66,6 +67,32 @@ void reset_mem_pool_data()
 	pool.used = 0;
 }
 
+static struct route_table_entry *alloc_rtable(const char *path);
+
+/*
+	Function that allocs the router resources
+	@param file - the file with the routing table
+*/
+void alloc_router_resources(const char *file)
+{
+	init_mem_pool(POW_2(8));
+
+	rtable = alloc_rtable(file);
+	rtable_len = read_rtable(file, rtable);
+
+	arp_table = malloc(MAX_ARP_TABLE_LEN * sizeof(*arp_table));
+	if (!arp_table) {
+		fprintf(stderr, "Could not allocate arp table\n");
+		exit(EXIT_FAILURE);
+	}
+
+	packets_queue = queue_create();
+	if (!packets_queue) {
+		fprintf(stderr, "Could not allocate packets queue\n");
+		exit(EXIT_FAILURE);
+	}
+}
+
 /*
 	Function that frees the resources used by the router
 */
@@ -76,6 +103,7 @@ void free_router_resources()
 	free(packets_queue);
 	free(pool.memory);
 }
+
 
 /*
 	Function that allocs the rtable by number of lines
@@ -109,6 +137,8 @@ static struct route_table_entry *alloc_rtable(const char *path)
     return rtable;
 
 }
+
+#undef ROUTER_RESOURCES_SECTION
 
 /*
 	Function that compares two route table entries
@@ -150,9 +180,8 @@ static struct route_table_entry *get_best_rtable(uint32_t ip_dest)
 
 		if ((ip_dest & rtable[mid].mask) == rtable[mid].prefix
 			 && ((!next_hop)
-			 || (ntohl(rtable[mid].mask) > ntohl(next_hop->mask)))) {
+			 || (ntohl(rtable[mid].mask) > ntohl(next_hop->mask))))
     			next_hop = &rtable[mid];
-		}
 
 		if (ntohl(rtable[mid].prefix) >= ntohl(ip_dest))
 			left = mid + 1;
@@ -167,11 +196,9 @@ static struct route_table_entry *get_best_rtable(uint32_t ip_dest)
 */
 struct arp_table_entry *get_best_arp(uint32_t dest_ip)
 {
-    for (int i = 0; i < arp_table_len; ++i) {
-        if (arp_table[i].ip == dest_ip) {
+    for (int i = 0; i < arp_table_len; ++i)
+        if (arp_table[i].ip == dest_ip)
             return &arp_table[i];
-        }
-    }
     return NULL;
 }
 
@@ -180,10 +207,11 @@ struct arp_table_entry *get_best_arp(uint32_t dest_ip)
 	@param eth - the ethernet header
 	@param next - the next hop
 	@param interface - the interface
+	@param router_ip - the ip of the router
 */
 static void send_arp_request(struct ether_header *eth,
 							 struct route_table_entry *next,
-							 uint32_t interface)
+							 uint32_t interface, uint32_t router_ip)
 {
 	struct arp_header *arp = (struct arp_header *)(eth + OFFSET_ADDR);
 
@@ -204,9 +232,6 @@ static void send_arp_request(struct ether_header *eth,
 	// set the source mac and ip
 	get_interface_mac(next->interface, arp->sha);
 
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
-
 	arp->spa = router_ip;
 	arp->tpa = next->next_hop;
 
@@ -220,9 +245,10 @@ static void send_arp_request(struct ether_header *eth,
 	@param interface - the interface
 	@param eth - the ethernet header
 	@param  type - the type of icmp packet
+	@param router_ip - the ip of the router
 */
 static void send_icmp_packet(struct ether_header *eth,
-							 uint32_t interface, uint8_t type)
+							 uint32_t interface, uint8_t type, uint32_t router_ip)
 {
 	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 	struct icmphdr *icmp = (struct icmphdr *)(ip + OFFSET_ADDR);
@@ -238,12 +264,16 @@ static void send_icmp_packet(struct ether_header *eth,
 	// 64 + 8 = 72
 	// bassically we reconstruct the ip header in the icmp body
 	// it's like a debuggin tool
-	uint32_t length = sizeof(*ip) + 8;
+	uint32_t length;
+	if (type == 0) {
+		// handle the reques/reply
+		length = ntohs(ip->tot_len) - sizeof(*ip) - sizeof(*icmp); 
+	} else {
+		// handle the ntimeout and host unreach
+		length = sizeof(*ip) +8;
+	}
 
 	memcpy(pool.memory, ip, length);
-
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
 	// set the ip header
 	// we swap the source and destination ip addresses
@@ -271,68 +301,16 @@ static void send_icmp_packet(struct ether_header *eth,
 
 /*
 	Function that sends a packet to a link
-	The packet is intended for the router (echo request // echo reply)
-	@param interface - the interface
-	@param eth - the ethernet header
-	@param len - the length
-
-*/
-static void ip_packet_for_router(struct ether_header *eth,
-								 uint32_t interface, uint32_t len)
-{
-	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
-
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
-
-	struct icmphdr *icmp = (struct icmphdr *)(ip + OFFSET_ADDR);
-
-	icmp->type = icmp->code = icmp->checksum = 0;
-	icmp->checksum = htons(checksum((uint16_t *)icmp, sizeof(*icmp)));
-
-	uint32_t length = ntohs(ip->tot_len) - sizeof(*ip) - sizeof(*icmp);
-
-	memcpy(pool.memory, ip, length);
-
-	// swap the source and destination ip addresses again
-	// set the rest of the fields
-	ip->daddr = ip->saddr;
-	ip->saddr = router_ip;
-	ip->ttl = htons(TTL_MAX);
-	ip->protocol = IPPROTO_ICMP;
-	ip->tot_len = htons((uint16_t)length + sizeof(*ip) + sizeof(*icmp));
-
-	ip->check = 0;
-	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
-
-	// swap the mac addresses again
-	memcpy(eth->ether_dhost, eth->ether_shost, sizeof(eth->ether_shost));
-
-	get_interface_mac(interface, eth->ether_shost);
-
-	memcpy((char *)icmp + sizeof(*icmp), pool.memory, length);
-
-	send_to_link(interface, (char *)eth, sizeof(*eth)
-				 + sizeof(*ip) + sizeof(*icmp) + length);
-
-	// reset the mem pool for next use
-	reset_mem_pool_data();
-}
-
-/*
-	Function that sends a packet to a link
 	The packet is intended for a host
 	@param interface - the interface
 	@param eth - the ethernet header
 	@param len - the length
+	@param router_ip - the ip of the router
 */
 static void ip_packet_for_host(struct ether_header *eth,
-							   uint32_t interface, uint32_t len)
+							   uint32_t interface, uint32_t len, uint32_t router_ip)
 {
 	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
-
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
 	uint16_t old_checksum = ip->check;
 	ip->check = 0;
@@ -343,7 +321,7 @@ static void ip_packet_for_host(struct ether_header *eth,
 	
 	// ttl check && send icmp packet for ttl exceeded
 	if (ip->ttl <= 1) {
-		send_icmp_packet(eth, interface, 11);
+		send_icmp_packet(eth, interface, 11, router_ip);
 		return;
 	}
 
@@ -351,11 +329,12 @@ static void ip_packet_for_host(struct ether_header *eth,
 	ip->check = 0;
 	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
 
-	// get best route && send icmp packet for destination unreachable
+	// get best route
 	struct route_table_entry *next = get_best_rtable(ip->daddr);
+
 	// if we don't have a route send icmp packet
 	if (!next) {
-		send_icmp_packet(eth, interface, 3);
+		send_icmp_packet(eth, interface, 3, router_ip);
 		return;
 	}
 
@@ -379,7 +358,7 @@ static void ip_packet_for_host(struct ether_header *eth,
 		entry->next_route = next;
 		queue_enq(packets_queue, entry);
 		// send arp request
-		send_arp_request(eth, next, next->interface);
+		send_arp_request(eth, next, next->interface, router_ip);
 		return;
 	}
 
@@ -400,12 +379,13 @@ static void send_ip_packet(struct ether_header *eth,
 {
 	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
+	// transform the ip address, reduce redundanc and repetitive code
 	uint32_t router_ip;
 	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 
 	// If the packet is for the router or for a host
-	(ip->daddr == router_ip) ? ip_packet_for_router(eth, interface, len)
-							 : ip_packet_for_host(eth, interface, len);
+	(ip->daddr == router_ip) ? send_icmp_packet(eth, interface, 0, router_ip)
+							 : ip_packet_for_host(eth, interface, len, router_ip);
 
 }
 
@@ -488,24 +468,10 @@ int main(int argc, char *argv[])
 	// Do not modify this line
 	init(argc - 2, argv + 2);
 
-	init_mem_pool(POW_2(8));
+	// our heap data
+	alloc_router_resources(argv[1]);
 
-	rtable = alloc_rtable(argv[1]);
-	rtable_len = read_rtable(argv[1], rtable);
-
-	arp_table = malloc(MAX_ARP_TABLE_LEN * sizeof(*arp_table));
-	if (!arp_table) {
-		fprintf(stderr, "Could not allocate arp table\n");
-		exit(EXIT_FAILURE);
-	}
-
-	packets_queue = queue_create();
-	if (!packets_queue) {
-		fprintf(stderr, "Could not allocate packets queue\n");
-		exit(EXIT_FAILURE);
-	}
-
-	qsort(rtable, rtable_len, sizeof(struct route_table_entry),
+	qsort(rtable, rtable_len, sizeof(*rtable),
 		  comparator_function);
 
 	while (1) {
