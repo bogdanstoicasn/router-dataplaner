@@ -77,9 +77,6 @@ Common points between the ip related functions:
 
 Different points between the ip related functions:
 
-- `ip_packet_for_router`: swap all addresses and
-send the reply.
-
 - `ip_packet_for_host`: searching best route using binary search and longest
 prefix match, inserting the arp packet in the queue if needed
 (macs not in cache).
@@ -120,9 +117,4 @@ resources for this project. The checker is very easy to use and the tests are ve
 - [Book: Computer Networks - A Tanenbaum](https://www.amazon.com/Computer-Networks-5th-Andrew-Tanenbaum/dp/0132126958)
 - [Playlist](https://youtube.com/playlist?list=PLowKtXNTBypH19whXTVoG3oKSuOcw_XeW&si=5J23PKLih33J-OsU)
 - [Basic Information](https://networkdirection.net/articles/network-theory/controlanddataplane/)
-
-
-
-
-
 

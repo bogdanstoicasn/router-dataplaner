@@ -173,22 +173,22 @@ static struct route_table_entry *get_best_rtable(uint32_t ip_dest)
 {
 	int left = 0;
 	int right = rtable_len - 1;
-	struct route_table_entry *next_hop = NULL;
+	struct route_table_entry *best_hop = NULL;
 
 	while (left <= right) {
 		int mid = left + (right - left) / 2;
 
 		if ((ip_dest & rtable[mid].mask) == rtable[mid].prefix
-			 && ((!next_hop)
-			 || (ntohl(rtable[mid].mask) > ntohl(next_hop->mask))))
-    			next_hop = &rtable[mid];
+			 && ((!best_hop)
+			 || (ntohl(rtable[mid].mask) > ntohl(best_hop->mask))))
+    			best_hop = &rtable[mid];
 
 		if (ntohl(rtable[mid].prefix) >= ntohl(ip_dest))
 			left = mid + 1;
 		else
 			right = mid - 1;
 	}
-	return next_hop;
+	return best_hop;
 }
 
 /*
@@ -200,6 +200,16 @@ struct arp_table_entry *get_best_arp(uint32_t dest_ip)
         if (arp_table[i].ip == dest_ip)
             return &arp_table[i];
     return NULL;
+}
+
+
+/*
+	Function that recalculates the checksum
+*/
+void recalculate_checksum(struct iphdr *ip)
+{
+	ip->check = 0;
+	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
 }
 
 /*
@@ -257,8 +267,8 @@ static void send_icmp_packet(struct ether_header *eth,
 	// 11 - ttl exceeded
 	// 3 - destination unreachable
 	icmp->type = type;
-	icmp->code = icmp->checksum = 0;
-	icmp->checksum = htons(checksum((uint16_t *)icmp, sizeof(*icmp)));
+	
+	recalculate_checksum(ip);
 
 	// prepare the icmp body with ipv4 and its first 8 bytes
 	// 64 + 8 = 72
@@ -283,8 +293,8 @@ static void send_icmp_packet(struct ether_header *eth,
 	ip->ttl = htons(TTL_MAX);
 	ip->protocol = IPPROTO_ICMP; // not used but good practice
 	ip->tot_len = htons(length + sizeof(*ip) + sizeof(*icmp)); 
-	ip->check = 0;
-	ip->check  = htons(checksum((uint16_t *)ip, sizeof(*ip)));
+	
+	recalculate_checksum(ip);
 
 	// swap the mac addresses as well
 	memcpy(eth->ether_dhost, eth->ether_shost, sizeof(eth->ether_shost));
@@ -313,8 +323,8 @@ static void ip_packet_for_host(struct ether_header *eth,
 	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
 	uint16_t old_checksum = ip->check;
-	ip->check = 0;
-	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
+	// recalculate the checksum
+	recalculate_checksum(ip);
 
 	if (old_checksum != ip->check)
 		return;
@@ -326,8 +336,8 @@ static void ip_packet_for_host(struct ether_header *eth,
 	}
 
 	--ip->ttl;
-	ip->check = 0;
-	ip->check = htons(checksum((uint16_t *)ip, sizeof(*ip)));
+	
+	recalculate_checksum(ip);
 
 	// get best route
 	struct route_table_entry *next = get_best_rtable(ip->daddr);
@@ -343,28 +353,28 @@ static void ip_packet_for_host(struct ether_header *eth,
 
 	get_interface_mac(next->interface, eth->ether_shost);
 
-	// put arp packet in queue if we don't have the mac
-	// then send the arp request to get the mac
-	if (!arp) {
-
-		struct waiting_element *entry = malloc(sizeof(*entry));
-		DIE(entry == NULL, "malloc in ip_packet");
-
-		entry->eth_hdr = malloc(len);
-		DIE(entry->eth_hdr == NULL, "malloc in ip_packet");
-
-		memcpy(entry->eth_hdr, eth, len);
-		entry->len = len;
-		entry->next_route = next;
-		queue_enq(packets_queue, entry);
-		// send arp request
-		send_arp_request(eth, next, next->interface, router_ip);
+	// if the arp entry is in the table send the packet
+	if (arp) {
+		memcpy(eth->ether_dhost, arp->mac, sizeof(arp->mac));
+		send_to_link(next->interface, (char *)eth, len);
 		return;
 	}
 
-	memcpy(eth->ether_dhost, arp->mac, sizeof(arp->mac));
+	// put arp packet in queue if we don't have the mac
+	// then send the arp request to get the mac
+	struct waiting_element *entry = malloc(sizeof(*entry));
+	DIE(entry == NULL, "malloc in ip_packet");
 
-	send_to_link(next->interface, (char *)eth, len);
+	entry->eth_hdr = malloc(len);
+	DIE(entry->eth_hdr == NULL, "malloc in ip_packet");
+
+	memcpy(entry->eth_hdr, eth, len);
+	entry->len = len;
+	entry->next_route = next;
+	queue_enq(packets_queue, entry);
+
+	// send arp request
+	send_arp_request(eth, next, next->interface, router_ip);
 }
 
 /*
@@ -375,14 +385,11 @@ static void ip_packet_for_host(struct ether_header *eth,
 
 */
 static void send_ip_packet(struct ether_header *eth,
-						   uint32_t interface, uint32_t len)
+						   uint32_t interface, uint32_t len, uint32_t router_ip)
 {
 	struct iphdr *ip = (struct iphdr *)(eth + OFFSET_ADDR);
 
 	// transform the ip address, reduce redundanc and repetitive code
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
-
 	// If the packet is for the router or for a host
 	(ip->daddr == router_ip) ? send_icmp_packet(eth, interface, 0, router_ip)
 							 : ip_packet_for_host(eth, interface, len, router_ip);
@@ -396,7 +403,7 @@ static void send_ip_packet(struct ether_header *eth,
 	@param len - the length
 */
 static void send_arp_packet(struct ether_header *eth,
-							uint32_t interface, uint32_t len)
+							uint32_t interface, uint32_t len, uint32_t router_ip)
 {
 	struct arp_header *arp = (struct arp_header *)(eth + OFFSET_ADDR);
 
@@ -411,7 +418,7 @@ static void send_arp_packet(struct ether_header *eth,
 		while (!queue_empty(packets_queue)) {
 			struct waiting_element *entry = queue_deq(packets_queue);
 			send_ip_packet((struct ether_header *)entry->eth_hdr,
-						   interface, entry->len);
+						   interface, entry->len, router_ip);
 			free(entry->eth_hdr);
 			free(entry);
 		}
@@ -423,8 +430,6 @@ static void send_arp_packet(struct ether_header *eth,
 	// 2. set the op to 2
 	// 3. set the source mac to the router mac
 	// 4. set the destination mac to the source mac
-	uint32_t router_ip;
-	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 	if (arp->tpa != router_ip)
 		return;
 	
@@ -449,12 +454,14 @@ static void send_arp_packet(struct ether_header *eth,
 */
 void handle_packet(struct ether_header *eth, uint32_t interface, uint32_t len)
 {
+	uint32_t router_ip;
+	inet_pton(AF_INET, get_interface_ip(interface), &router_ip);
 	switch (ntohs(eth->ether_type)) {
 		case ETHERTYPE_IP:
-			send_ip_packet(eth, interface, len);
+			send_ip_packet(eth, interface, len, router_ip);
 			break;
 		case ETHERTYPE_ARP:
-			send_arp_packet(eth, interface, len);
+			send_arp_packet(eth, interface, len, router_ip);
 			break;
 		default:
 			break;
